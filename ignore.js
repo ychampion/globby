@@ -16,6 +16,7 @@ import {
 	findGitRootSync,
 	getParentGitignorePaths,
 	buildPrunePatternsAndGuards,
+	wrapFsForDirectoryPruning,
 	negationsCouldRescue,
 } from './utilities.js';
 
@@ -883,7 +884,12 @@ const filterKnownIgnoreFilePathsSync = (knownPaths, patterns, normalizedOptions)
 
 const getIgnoreFileSearchPrune = (searchPatterns, files, normalizedOptions, gitRoot) => {
 	if (files.length === 0) {
-		return {patterns: [], guardNames: []};
+		return {
+			patterns: [],
+			directoryPatterns: [],
+			directoryContentPatterns: [],
+			guardNames: [],
+		};
 	}
 
 	const {cwd} = normalizedOptions;
@@ -899,9 +905,34 @@ const getIgnoreFileSearchPrune = (searchPatterns, files, normalizedOptions, gitR
 	return buildPrunePatternsAndGuards(getIgnoreRules(files), matcher, cwd, {gitignoreOnlySearch, searchesForGitignoreFiles});
 };
 
-const withPrunedSearch = (normalizedOptions, prunePatterns) => prunePatterns.length === 0
-	? normalizedOptions
-	: {...normalizedOptions, ignore: [...normalizedOptions.ignore, ...prunePatterns]};
+const withPrunedSearch = (normalizedOptions, {
+	patterns = [],
+	directoryPatterns = [],
+	directoryContentPatterns = [],
+}) => {
+	const hasIgnorePatterns = patterns.length > 0;
+	const hasDirectoryPrune = directoryPatterns.length > 0 || directoryContentPatterns.length > 0;
+
+	if (!hasIgnorePatterns && !hasDirectoryPrune) {
+		return normalizedOptions;
+	}
+
+	const prunedOptions = {
+		...normalizedOptions,
+		...(hasIgnorePatterns ? {ignore: [...normalizedOptions.ignore, ...patterns]} : {}),
+	};
+
+	if (hasDirectoryPrune) {
+		prunedOptions.fs = wrapFsForDirectoryPruning(
+			normalizedOptions.fs,
+			{directoryPatterns, directoryContentPatterns},
+			normalizedOptions.cwd,
+			{caseSensitiveMatch: normalizedOptions.caseSensitiveMatch},
+		);
+	}
+
+	return prunedOptions;
+};
 
 // The known ignore files have already been read; only the newly discovered ones are left.
 const getUnreadPaths = (childPaths, knownPaths) => {
@@ -922,9 +953,9 @@ const collectIgnoreFileArtifactsAsync = async (patterns, options, includeParentI
 		normalizedOptions,
 	);
 	const knownFiles = await readIgnoreFilesSafely(knownPaths, readFileMethod, normalizedOptions.suppressErrors);
-	const {patterns: prunePatterns, guardNames} = getIgnoreFileSearchPrune(patterns, knownFiles, normalizedOptions, gitRoot);
+	const {guardNames, ...prune} = getIgnoreFileSearchPrune(patterns, knownFiles, normalizedOptions, gitRoot);
 
-	const childPaths = await globIgnoreFiles(fastGlob, patterns, withPrunedSearch(normalizedOptions, prunePatterns));
+	const childPaths = await globIgnoreFiles(fastGlob, patterns, withPrunedSearch(normalizedOptions, prune));
 	let childFiles = await readIgnoreFilesSafely(getUnreadPaths(childPaths, knownPaths), readFileMethod, normalizedOptions.suppressErrors);
 
 	// A negation found by the pruned search can re-include a directory the prune patterns skipped, hiding the ignore files inside it. Repeat the search without pruning when that happens; a single unpruned pass finds everything, so once is enough.
@@ -949,9 +980,9 @@ const collectIgnoreFileArtifactsSync = (patterns, options, includeParentIgnoreFi
 		normalizedOptions,
 	);
 	const knownFiles = readIgnoreFilesSafelySync(knownPaths, readFileSyncMethod, normalizedOptions.suppressErrors);
-	const {patterns: prunePatterns, guardNames} = getIgnoreFileSearchPrune(patterns, knownFiles, normalizedOptions, gitRoot);
+	const {guardNames, ...prune} = getIgnoreFileSearchPrune(patterns, knownFiles, normalizedOptions, gitRoot);
 
-	const childPaths = globIgnoreFiles(fastGlob.sync, patterns, withPrunedSearch(normalizedOptions, prunePatterns));
+	const childPaths = globIgnoreFiles(fastGlob.sync, patterns, withPrunedSearch(normalizedOptions, prune));
 	let childFiles = readIgnoreFilesSafelySync(getUnreadPaths(childPaths, knownPaths), readFileSyncMethod, normalizedOptions.suppressErrors);
 
 	// See `collectIgnoreFileArtifactsAsync`: a rescuing negation means the pruned search may have missed files.

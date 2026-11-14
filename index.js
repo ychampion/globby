@@ -21,6 +21,7 @@ import {
 	normalizeNegativePattern,
 	adjustIgnorePatternsForParentDirectories,
 	convertPatternsForFastGlob,
+	wrapFsForDirectoryPruning,
 	convertIgnorePatternsForIgnoreFileSearch,
 	findGitRoot,
 	findGitRootSync,
@@ -233,15 +234,22 @@ const combinePredicate = (matcher, globalMatcher) => {
 	};
 };
 
+const EMPTY_PRUNE = {
+	patterns: [],
+	directoryPatterns: [],
+	directoryContentPatterns: [],
+};
+
 const buildIgnoreFilterResult = ({options, cwd, ignoreResult: {rules, matcher}, globalMatcher, createFilter}) => {
 	const finalPredicate = combinePredicate(matcher, globalMatcher);
 
-	// Patterns fast-glob can use to skip ignored directories while traversing. The predicate below stays authoritative, so this only ever needs to be safe, never exhaustive. They are returned separately from `options.ignore` so they skip directory expansion and the parent-directory adjustment, which would rebase them outside the scope their ignore files govern.
-	const pruneIgnorePatterns = convertPatternsForFastGlob(rules, matcher, cwd);
+	// Rules are split into safe `fast-glob` ignore patterns and directory-only prune patterns.
+	// Directory-only prune patterns skip matching directories at the `fs` level so regular files with the same name are kept, while the predicate remains authoritative.
+	const prune = convertPatternsForFastGlob(rules, matcher, cwd);
 
 	return {
 		options,
-		pruneIgnorePatterns,
+		prune,
 		filter: createFilter(finalPredicate, cwd, options.fs),
 	};
 };
@@ -270,7 +278,7 @@ const applyIgnoreFilesAndGetFilter = async options => {
 	if (ignoreFilesPatterns.length === 0 && !globalIgnoreFile) {
 		return {
 			options,
-			pruneIgnorePatterns: [],
+			prune: EMPTY_PRUNE,
 			filter: createFilterFunctionAsync(false, cwd, options.fs),
 		};
 	}
@@ -307,7 +315,7 @@ const applyIgnoreFilesAndGetFilterSync = options => {
 	if (ignoreFilesPatterns.length === 0 && !globalIgnoreFile) {
 		return {
 			options,
-			pruneIgnorePatterns: [],
+			prune: EMPTY_PRUNE,
 			filter: createFilterFunction(false, cwd, options.fs),
 		};
 	}
@@ -565,28 +573,51 @@ const applyParentDirectoryIgnoreAdjustments = tasks => tasks.map(task => ({
 // Prune patterns are appended after directory expansion and the parent-directory adjustment on
 // purpose: they are already glob-shaped, and rebasing them onto a `../` prefix would let them
 // ignore paths outside the scope of the ignore files they came from.
-const appendPruneIgnorePatterns = (tasks, pruneIgnorePatterns) => pruneIgnorePatterns.length === 0
-	? tasks
-	: tasks.map(task => ({
+const applyPruneToTasks = (tasks, prune) => {
+	const {
+		patterns = [],
+		directoryPatterns = [],
+		directoryContentPatterns = [],
+	} = prune ?? {};
+	const hasIgnorePatterns = patterns.length > 0;
+	const hasDirectoryPrune = directoryPatterns.length > 0 || directoryContentPatterns.length > 0;
+
+	if (tasks.length === 0 || (!hasIgnorePatterns && !hasDirectoryPrune)) {
+		return tasks;
+	}
+
+	const firstOptions = tasks[0].options;
+	const prunedFs = hasDirectoryPrune
+		? wrapFsForDirectoryPruning(
+			firstOptions.fs,
+			{directoryPatterns, directoryContentPatterns},
+			firstOptions.cwd ?? process.cwd(),
+			{caseSensitiveMatch: firstOptions.caseSensitiveMatch},
+		)
+		: undefined;
+
+	return tasks.map(task => ({
 		patterns: task.patterns,
 		options: {
 			...task.options,
-			ignore: [...task.options.ignore, ...pruneIgnorePatterns],
+			...(hasIgnorePatterns ? {ignore: [...task.options.ignore, ...patterns]} : {}),
+			...(prunedFs ? {fs: prunedFs} : {}),
 		},
 	}));
+};
 
 const normalizeExpandDirectoriesOption = (options, cwd) => ({
 	...(cwd ? {cwd} : {}),
 	...(Array.isArray(options) ? {files: options} : options),
 });
 
-const generateTasks = async (patterns, options, pruneIgnorePatterns = []) => {
+const generateTasks = async (patterns, options, prune = EMPTY_PRUNE) => {
 	const globTasks = convertNegativePatterns(patterns, options);
 
 	const {cwd, expandDirectories, fs: fsImplementation} = options;
 
 	if (!expandDirectories) {
-		return appendPruneIgnorePatterns(applyParentDirectoryIgnoreAdjustments(globTasks), pruneIgnorePatterns);
+		return applyPruneToTasks(applyParentDirectoryIgnoreAdjustments(globTasks), prune);
 	}
 
 	const directoryToGlobOptions = {
@@ -611,15 +642,15 @@ const generateTasks = async (patterns, options, pruneIgnorePatterns = []) => {
 		return {patterns, options};
 	}));
 
-	return appendPruneIgnorePatterns(tasks, pruneIgnorePatterns);
+	return applyPruneToTasks(tasks, prune);
 };
 
-const generateTasksSync = (patterns, options, pruneIgnorePatterns = []) => {
+const generateTasksSync = (patterns, options, prune = EMPTY_PRUNE) => {
 	const globTasks = convertNegativePatterns(patterns, options);
 	const {cwd, expandDirectories, fs: fsImplementation} = options;
 
 	if (!expandDirectories) {
-		return appendPruneIgnorePatterns(applyParentDirectoryIgnoreAdjustments(globTasks), pruneIgnorePatterns);
+		return applyPruneToTasks(applyParentDirectoryIgnoreAdjustments(globTasks), prune);
 	}
 
 	const directoryToGlobSyncOptions = {
@@ -638,17 +669,17 @@ const generateTasksSync = (patterns, options, pruneIgnorePatterns = []) => {
 		return {patterns, options};
 	});
 
-	return appendPruneIgnorePatterns(tasks, pruneIgnorePatterns);
+	return applyPruneToTasks(tasks, prune);
 };
 
 export const globby = normalizeArguments(async (patterns, options) => {
 	assertGlobalGitignoreAsyncSupport(options);
 
 	// Apply ignore files and get filter (reads .gitignore files once)
-	const {options: modifiedOptions, pruneIgnorePatterns, filter} = await applyIgnoreFilesAndGetFilter(options);
+	const {options: modifiedOptions, prune, filter} = await applyIgnoreFilesAndGetFilter(options);
 
-	// Generate tasks, attaching the prune patterns so fast-glob skips ignored directories
-	const tasks = await generateTasks(patterns, modifiedOptions, pruneIgnorePatterns);
+	// Generate tasks, attaching prune ignore patterns and directory-pruning fs wrapper so fast-glob skips ignored directories
+	const tasks = await generateTasks(patterns, modifiedOptions, prune);
 
 	const results = await Promise.all(tasks.map(task => fastGlob(task.patterns, task.options)));
 	return unionFastGlobResultsAsync(results, filter);
@@ -658,10 +689,10 @@ export const globbySync = normalizeArgumentsSync((patterns, options) => {
 	assertGlobalGitignoreSyncSupport(options);
 
 	// Apply ignore files and get filter (reads .gitignore files once)
-	const {options: modifiedOptions, pruneIgnorePatterns, filter} = applyIgnoreFilesAndGetFilterSync(options);
+	const {options: modifiedOptions, prune, filter} = applyIgnoreFilesAndGetFilterSync(options);
 
-	// Generate tasks, attaching the prune patterns so fast-glob skips ignored directories
-	const tasks = generateTasksSync(patterns, modifiedOptions, pruneIgnorePatterns);
+	// Generate tasks, attaching prune ignore patterns and directory-pruning fs wrapper so fast-glob skips ignored directories
+	const tasks = generateTasksSync(patterns, modifiedOptions, prune);
 
 	const results = tasks.map(task => fastGlob.sync(task.patterns, task.options));
 	return unionFastGlobResults(results, filter);
@@ -673,10 +704,10 @@ export const globbyStream = normalizeArgumentsSync((patterns, options) => {
 	const seen = new Set();
 	const stream = Readable.from((async function * () {
 		// Apply ignore files and get filter (reads .gitignore files once)
-		const {options: modifiedOptions, pruneIgnorePatterns, filter} = await applyIgnoreFilesAndGetFilter(options);
+		const {options: modifiedOptions, prune, filter} = await applyIgnoreFilesAndGetFilter(options);
 
-		// Generate tasks, attaching the prune patterns so fast-glob skips ignored directories
-		const tasks = await generateTasks(patterns, modifiedOptions, pruneIgnorePatterns);
+		// Generate tasks, attaching prune ignore patterns and directory-pruning fs wrapper so fast-glob skips ignored directories
+		const tasks = await generateTasks(patterns, modifiedOptions, prune);
 
 		if (tasks.length === 0) {
 			return;

@@ -1,3 +1,4 @@
+import process from 'node:process';
 import fs from 'node:fs';
 import path from 'node:path';
 import {promisify} from 'node:util';
@@ -6,6 +7,7 @@ import gitIgnore, {isPathValid} from 'ignore';
 import isPathInside from 'is-path-inside';
 import micromatch from 'micromatch';
 import slash from 'slash';
+import {toPath} from 'unicorn-magic/node';
 
 export const isNegativePattern = pattern => pattern[0] === '!';
 
@@ -499,8 +501,57 @@ export const convertIgnorePatternsForIgnoreFileSearch = (ignorePatterns, searchP
 	return ignorePatterns.filter(pattern => !expandBraceGroups(pattern).some(expanded => couldNameAnIgnoreFile(expanded)));
 };
 
+const TRAILING_GLOBSTAR_REGEX = /(?:^|[^\\])(?:\\\\)*\/\*\*$/u;
+
+const formatRulePrune = (value, guardName, {isDirectoryPattern, isGlob}) => {
+	if (isDirectoryPattern) {
+		return {directoryPattern: value, guardName};
+	}
+
+	// Rules ending with `/**` (such as `build/**` or `**/build/**`) only ignore contents inside matching directories, never files or empty directories with the same name.
+	if (isGlob && value !== '**' && TRAILING_GLOBSTAR_REGEX.test(value)) {
+		const directoryTarget = value.slice(0, -3);
+		if (directoryTarget && directoryTarget !== '**') {
+			return {directoryContentPattern: directoryTarget, guardName};
+		}
+	}
+
+	return {pattern: value, guardName};
+};
+
+const getAnchoredRulePrune = ({body, directory, isDirectoryPattern, isGlob, ruleShape}, {cwd, matcher, hasNegations, gitignoreOnlySearch}) => {
+	const anchoredBody = body.replace(/^\//u, '');
+	const target = anchorToCwd(directory, isGlob ? anchoredBody : unescapeGitignorePattern(anchoredBody), cwd);
+	if (target === undefined) {
+		return undefined;
+	}
+
+	// The guard name is compared against negations as rule text, so it has to keep the escapes the rule was written with; the target has already lost them.
+	const guardName = finalSegment(anchoredBody);
+
+	if (isGlob) {
+		// A glob does not name a concrete path, so the matcher cannot confirm it is ignored.
+		return hasNegations
+			? undefined
+			: formatRulePrune(target, guardName, ruleShape);
+	}
+
+	const resolvedTarget = path.resolve(cwd, target);
+	if (!matcher(`${resolvedTarget}${path.sep}`).ignored || (!isDirectoryPattern && !matcher(resolvedTarget).ignored)) {
+		return undefined;
+	}
+
+	// A direct child of the cwd can only be re-included by a rule at or above the cwd, and in a pure gitignore search those rules are all known already. A deeper target has intermediate directories whose ignore files may not have been read yet.
+	const needsGuard = !gitignoreOnlySearch || target.includes('/');
+	return formatRulePrune(
+		fastGlob.escapePath(target),
+		needsGuard ? guardName : undefined,
+		ruleShape,
+	);
+};
+
 // Compute the prune pattern for a single rule, or undefined when the rule cannot be skipped safely. The returned object also carries the guard name (if any) whose skipping relies on the rule set being complete.
-const getRulePrune = ({pattern, directory}, {cwd, matcher, hasNegations, canSkipAtAnyDepth, canMatchIgnoreFile, gitignoreOnlySearch}) => {
+const getRulePrune = ({pattern, directory}, context) => {
 	if (isNegativePattern(pattern)) {
 		return undefined;
 	}
@@ -516,7 +567,12 @@ const getRulePrune = ({pattern, directory}, {cwd, matcher, hasNegations, canSkip
 		? clean.slice(3)
 		: clean;
 
-	if (canMatchIgnoreFile(finalSegment(body))) {
+	// Rules ending with `/**/` only ignore subdirectories inside the named directory, not regular files directly inside it, so skipping the directory itself would drop kept files.
+	if (isDirectoryPattern && body !== '**' && TRAILING_GLOBSTAR_REGEX.test(body)) {
+		return undefined;
+	}
+
+	if (context.canMatchIgnoreFile(finalSegment(body))) {
 		// Contents-only rules such as `foo/*` still allow traversal to `foo/.gitignore`, so the ignore-file search must read it before pruning foo's contents.
 		return undefined;
 	}
@@ -526,48 +582,31 @@ const getRulePrune = ({pattern, directory}, {cwd, matcher, hasNegations, canSkip
 		return undefined;
 	}
 
-	// The leading slash stops the normalizer from prefixing `**/`; the passed value already encodes the depth, and an extra `**/` would un-anchor an anchored rule.
-	const toFastGlob = value =>
-		normalizeDirectoryPatternForFastGlob(`/${value}${isDirectoryPattern ? '/' : ''}`).replace(/^\//u, '');
+	const ruleShape = {isDirectoryPattern, isGlob};
 
 	// No separator: matches at any depth below the ignore file that declared it.
-	if (!body.includes('/') && canSkipAtAnyDepth(body)) {
-		const relativeDirectory = slash(path.relative(cwd, directory));
+	if (!body.includes('/') && context.canSkipAtAnyDepth(body)) {
+		const relativeDirectory = slash(path.relative(context.cwd, directory));
 		const prefix = isInsideCwd(relativeDirectory) ? `${fastGlob.escapePath(relativeDirectory)}/` : '';
-		return {pattern: toFastGlob(`${prefix}**/${isGlob ? body : toLiteralPattern(body)}`), guardName: body};
+		const wildcardTarget = isGlob ? body : toLiteralPattern(body);
+		const anyDepthPattern = wildcardTarget === '**' ? `${prefix}**` : `${prefix}**/${wildcardTarget}`;
+		return formatRulePrune(anyDepthPattern, body, ruleShape);
 	}
 
-	// Otherwise fall back to the single occurrence beside the ignore file, which names a concrete path that the matcher can verify directly.
-	const anchoredBody = body.replace(/^\//u, '');
-	const target = anchorToCwd(directory, isGlob ? anchoredBody : unescapeGitignorePattern(anchoredBody), cwd);
-	if (target === undefined) {
-		return undefined;
-	}
-
-	// The guard name is compared against negations as rule text, so it has to keep the escapes the rule was written with; the target has already lost them.
-	const guardName = finalSegment(anchoredBody);
-
-	if (isGlob) {
-		// A glob does not name a concrete path, so the matcher cannot confirm it is ignored.
-		return hasNegations
-			? undefined
-			: {pattern: toFastGlob(target), guardName};
-	}
-
-	if (!matcher(path.resolve(cwd, target) + path.sep).ignored) {
-		return undefined;
-	}
-
-	// A direct child of the cwd can only be re-included by a rule at or above the cwd, and in a pure gitignore search those rules are all known already. A deeper target has intermediate directories whose ignore files may not have been read yet.
-	const needsGuard = !gitignoreOnlySearch || target.includes('/');
-	return {
-		pattern: toFastGlob(fastGlob.escapePath(target)),
-		guardName: needsGuard ? guardName : undefined,
-	};
+	return getAnchoredRulePrune(
+		{
+			body,
+			directory,
+			isDirectoryPattern,
+			isGlob,
+			ruleShape,
+		},
+		context,
+	);
 };
 
 /**
-Build the ignore patterns handed to fast-glob so it can skip ignored directories while traversing.
+Build the prune patterns used to skip ignored directories while traversing.
 
 The authoritative filter is always the predicate, so these patterns only ever need to be safe:
 skipping something the predicate would have kept loses files, while skipping less than possible
@@ -580,6 +619,11 @@ merely costs time. Two facts from the gitignore spec make aggressive skipping sa
   patterns already rebased onto some other directory - keeps that distinction intact, which is
   what lets this work from a subdirectory of the repository too.
 
+Directory-only rules (e.g. `build/`) and contents-only rules (e.g. `build/**`) cannot be passed to
+fast-glob's `ignore` option because `ignore` would also exclude regular files of the same name.
+Instead, they are separated into `directoryPatterns` and `directoryContentPatterns` and pruned
+at the filesystem (`readdir`) level only when entries are actually directories.
+
 The returned guard names are the directory names whose skipping relies on the given rules being
 complete. A caller working from a partial rule set (the ignore-file search) must watch for later
 negations that could name one of them; see `negationsCouldRescue`.
@@ -590,11 +634,16 @@ negations that could name one of them; see `negationsCouldRescue`.
 @param {Object} [options] - Options.
 @param {boolean} [options.gitignoreOnlySearch] - Whether the rule set can only grow through nested `.gitignore` files.
 @param {boolean} [options.searchesForGitignoreFiles] - Whether the search includes `.gitignore` files.
-@returns {{patterns: string[], guardNames: string[]}} Patterns safe to pass to fast-glob, and the names their safety depends on.
+@returns {{patterns: string[], directoryPatterns: string[], directoryContentPatterns: string[], guardNames: string[]}} Patterns safe to pass to fast-glob or directory-level pruning, and the names their safety depends on.
 */
 export const buildPrunePatternsAndGuards = (rules, matcher, cwd, {gitignoreOnlySearch = false, searchesForGitignoreFiles = false} = {}) => {
 	if (!matcher || !cwd || !rules || rules.length === 0) {
-		return {patterns: [], guardNames: []};
+		return {
+			patterns: [],
+			directoryPatterns: [],
+			directoryContentPatterns: [],
+			guardNames: [],
+		};
 	}
 
 	const negationNames = getNegationFinalSegments(rules);
@@ -609,6 +658,8 @@ export const buildPrunePatternsAndGuards = (rules, matcher, cwd, {gitignoreOnlyS
 	};
 
 	const patterns = [];
+	const directoryPatterns = [];
+	const directoryContentPatterns = [];
 	const guardNames = [];
 
 	for (const rule of rules) {
@@ -617,13 +668,263 @@ export const buildPrunePatternsAndGuards = (rules, matcher, cwd, {gitignoreOnlyS
 			continue;
 		}
 
-		patterns.push(prune.pattern);
+		if (prune.pattern !== undefined) {
+			patterns.push(prune.pattern);
+		}
+
+		if (prune.directoryPattern !== undefined) {
+			directoryPatterns.push(prune.directoryPattern);
+		}
+
+		if (prune.directoryContentPattern !== undefined) {
+			directoryContentPatterns.push(prune.directoryContentPattern);
+		}
+
 		if (prune.guardName !== undefined) {
 			guardNames.push(prune.guardName);
 		}
 	}
 
-	return {patterns, guardNames};
+	return {
+		patterns,
+		directoryPatterns,
+		directoryContentPatterns,
+		guardNames,
+	};
 };
 
-export const convertPatternsForFastGlob = (rules, matcher, cwd) => buildPrunePatternsAndGuards(rules, matcher, cwd).patterns;
+export const convertPatternsForFastGlob = (rules, matcher, cwd) => {
+	const {patterns, directoryPatterns, directoryContentPatterns} = buildPrunePatternsAndGuards(rules, matcher, cwd);
+	return {
+		patterns,
+		directoryPatterns,
+		directoryContentPatterns,
+	};
+};
+
+const toRelativeDirectoryInCwd = (resolvedCwd, targetPath) => {
+	const resolvedDirectory = path.resolve(toPath(targetPath));
+	const relativeDirectory = slash(path.relative(resolvedCwd, resolvedDirectory));
+	if (relativeDirectory === '..' || relativeDirectory.startsWith('../') || path.isAbsolute(relativeDirectory)) {
+		return undefined;
+	}
+
+	return relativeDirectory;
+};
+
+const hasPrunedAncestor = (relativeDirectory, matcher) => {
+	if (!relativeDirectory) {
+		return false;
+	}
+
+	let index = -1;
+	while ((index = relativeDirectory.indexOf('/', index + 1)) !== -1) {
+		if (matcher(relativeDirectory.slice(0, index))) {
+			return true;
+		}
+	}
+
+	return matcher(relativeDirectory);
+};
+
+const getFsTarget = (fsImplementation, methodName) =>
+	typeof fsImplementation?.[methodName] === 'function' ? fsImplementation : fs;
+
+const getFirstMethod = (object, names) => names.find(name => typeof object?.[name] === 'function');
+
+const isDirectoryPathSync = (fsImplementation, entryPath) => {
+	const methodName = getFirstMethod(fsImplementation, ['lstatSync', 'statSync']);
+	const targetFs = methodName ? fsImplementation : fs;
+	const statMethod = targetFs[methodName ?? 'lstatSync'];
+	try {
+		return Boolean(statMethod.call(targetFs, entryPath)?.isDirectory?.());
+	} catch {
+		return false;
+	}
+};
+
+const readStatsAsync = async (fsImplementation, entryPath) => {
+	const callbackMethod = getFirstMethod(fsImplementation, ['lstat', 'stat']);
+	if (callbackMethod) {
+		return promisifyFsMethod(fsImplementation, callbackMethod)(entryPath);
+	}
+
+	const promiseMethod = getFirstMethod(fsImplementation?.promises, ['lstat', 'stat']);
+	if (promiseMethod) {
+		return fsImplementation.promises[promiseMethod](entryPath);
+	}
+
+	const syncMethod = getFirstMethod(fsImplementation, ['lstatSync', 'statSync']);
+	if (syncMethod) {
+		return fsImplementation[syncMethod](entryPath);
+	}
+
+	return promisifyFsMethod(fs, 'lstat')(entryPath);
+};
+
+const isDirectoryPathAsync = async (fsImplementation, entryPath) => {
+	try {
+		const stats = await readStatsAsync(fsImplementation, entryPath);
+		return Boolean(stats?.isDirectory?.());
+	} catch {
+		return false;
+	}
+};
+
+/**
+Wrap an fs implementation so directory-only prune rules omit matching directories (and avoid
+traversing into them or `directoryContentPatterns` directories) without dropping regular files
+that share the same name.
+
+@param {Object|undefined} fsImplementation - Custom fs implementation, or undefined to wrap `node:fs`.
+@param {{directoryPatterns?: string[], directoryContentPatterns?: string[]}} prunePatterns - Directory prune patterns relative to `cwd`.
+@param {string|URL} cwd - Base directory for the glob search.
+@param {Object} [options] - Matching options.
+@param {boolean} [options.caseSensitiveMatch=true] - Whether directory prune matching is case-sensitive.
+@returns {Object|undefined} Wrapped fs implementation, or the original `fsImplementation` if no directory pruning applies.
+*/
+export const wrapFsForDirectoryPruning = (fsImplementation, {
+	directoryPatterns = [],
+	directoryContentPatterns = [],
+} = {}, cwd = process.cwd(), {caseSensitiveMatch = true} = {}) => {
+	if (directoryPatterns.length === 0 && directoryContentPatterns.length === 0) {
+		return fsImplementation;
+	}
+
+	const resolvedCwd = path.resolve(toPath(cwd));
+	const matchOptions = {dot: true, nocase: !caseSensitiveMatch};
+	const matchesDirectory = directoryPatterns.length > 0
+		? micromatch.matcher(directoryPatterns, matchOptions)
+		: () => false;
+	const matchesAnyPrunedDirectory = micromatch.matcher(
+		[...directoryPatterns, ...directoryContentPatterns],
+		matchOptions,
+	);
+
+	const wrappedFs = fsImplementation ? {...fsImplementation} : {};
+	if (fsImplementation) {
+		for (const methodName of ['lstat', 'stat', 'lstatSync', 'statSync']) {
+			if (typeof fsImplementation[methodName] === 'function') {
+				wrappedFs[methodName] = bindFsMethod(fsImplementation, methodName);
+			}
+		}
+	}
+
+	const filterEntriesSync = (entries, directoryPath, relativeDirectory) => {
+		if (directoryPatterns.length === 0 || !Array.isArray(entries)) {
+			return entries;
+		}
+
+		const resolvedDirectory = path.resolve(toPath(directoryPath));
+		return entries.filter(entry => {
+			const isStringEntry = typeof entry === 'string';
+			const name = isStringEntry ? entry : entry?.name;
+			if (typeof name !== 'string') {
+				return true;
+			}
+
+			const entryRelativePath = relativeDirectory ? `${relativeDirectory}/${name}` : name;
+			if (!matchesDirectory(entryRelativePath)) {
+				return true;
+			}
+
+			if (!isStringEntry) {
+				return !(typeof entry.isDirectory === 'function' && entry.isDirectory());
+			}
+
+			return !isDirectoryPathSync(fsImplementation, path.join(resolvedDirectory, name));
+		});
+	};
+
+	const filterEntriesAsync = async (entries, directoryPath, relativeDirectory) => {
+		if (directoryPatterns.length === 0 || !Array.isArray(entries)) {
+			return entries;
+		}
+
+		const resolvedDirectory = path.resolve(toPath(directoryPath));
+		const keptFlags = await Promise.all(entries.map(async entry => {
+			const isStringEntry = typeof entry === 'string';
+			const name = isStringEntry ? entry : entry?.name;
+			if (typeof name !== 'string') {
+				return true;
+			}
+
+			const entryRelativePath = relativeDirectory ? `${relativeDirectory}/${name}` : name;
+			if (!matchesDirectory(entryRelativePath)) {
+				return true;
+			}
+
+			if (!isStringEntry) {
+				return !(typeof entry.isDirectory === 'function' && entry.isDirectory());
+			}
+
+			return !(await isDirectoryPathAsync(fsImplementation, path.join(resolvedDirectory, name)));
+		}));
+
+		return entries.filter((_, index) => keptFlags[index]);
+	};
+
+	wrappedFs.readdirSync = (directoryPath, options) => {
+		const relativeDirectory = toRelativeDirectoryInCwd(resolvedCwd, directoryPath);
+		if (relativeDirectory !== undefined && hasPrunedAncestor(relativeDirectory, matchesAnyPrunedDirectory)) {
+			return [];
+		}
+
+		const targetFs = getFsTarget(fsImplementation, 'readdirSync');
+		const entries = options === undefined
+			? targetFs.readdirSync(directoryPath)
+			: targetFs.readdirSync(directoryPath, options);
+
+		if (relativeDirectory === undefined) {
+			return entries;
+		}
+
+		return filterEntriesSync(entries, directoryPath, relativeDirectory);
+	};
+
+	wrappedFs.readdir = (directoryPath, optionsOrCallback, maybeCallback) => {
+		const hasOptions = typeof optionsOrCallback !== 'function';
+		const options = hasOptions ? optionsOrCallback : undefined;
+		const callback = hasOptions ? maybeCallback : optionsOrCallback;
+
+		const relativeDirectory = toRelativeDirectoryInCwd(resolvedCwd, directoryPath);
+		if (relativeDirectory !== undefined && hasPrunedAncestor(relativeDirectory, matchesAnyPrunedDirectory)) {
+			queueMicrotask(() => {
+				callback(null, []);
+			});
+			return;
+		}
+
+		const handleResult = async (error, entries) => {
+			if (error) {
+				callback(error);
+				return;
+			}
+
+			if (relativeDirectory === undefined) {
+				callback(null, entries);
+				return;
+			}
+
+			try {
+				const filteredEntries = await filterEntriesAsync(entries, directoryPath, relativeDirectory);
+				callback(null, filteredEntries);
+			} catch (filterError) {
+				callback(filterError);
+			}
+		};
+
+		const onReaddir = (error, entries) => {
+			handleResult(error, entries);
+		};
+
+		const targetFs = getFsTarget(fsImplementation, 'readdir');
+		if (hasOptions) {
+			targetFs.readdir(directoryPath, options, onReaddir);
+		} else {
+			targetFs.readdir(directoryPath, onReaddir);
+		}
+	};
+
+	return wrappedFs;
+};
